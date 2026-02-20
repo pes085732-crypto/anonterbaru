@@ -23,21 +23,29 @@ def init_db():
                   is_banned INTEGER DEFAULT 0)''')
     conn.execute('''CREATE TABLE IF NOT EXISTS config 
                  (id INTEGER PRIMARY KEY, qris_file_id TEXT, prem_text TEXT)''')
-    conn.execute("INSERT OR IGNORE INTO config (id, prem_text) VALUES (1, 'Teks Premium Belum Diatur')")
+    conn.execute("INSERT OR IGNORE INTO config (id, prem_text) VALUES (1, 'Kirim bukti transfer ke admin untuk aktivasi Premium.')")
     conn.commit()
     conn.close()
 
 init_db()
 
-# --- KEYBOARDS (FULL UI) ---
-def main_menu(uid):
+# --- HELPER: GET USER DATA ---
+def get_user_data(uid):
     conn = get_db()
     u = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    if u is None:
+        conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
+        conn.commit()
+        u = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
     conn.close()
-    
+    return u
+
+# --- KEYBOARDS ---
+def main_menu_kb(uid):
+    u = get_user_data(uid)
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(types.InlineKeyboardButton("Cari Partner 🔍", callback_data="find"),
-           types.InlineKeyboardButton("Set Lokasi 📍", callback_data="set_loc"))
+           types.InlineKeyboardButton(f"Lokasi: {u['loc'] or 'Belum Set'} 📍", callback_data="set_loc"))
     
     status_prem = "👑 Member Premium" if u['is_premium'] else "Beli Premium 💎"
     kb.add(types.InlineKeyboardButton(status_prem, callback_data="buy_prem"))
@@ -52,84 +60,105 @@ def chat_kb():
            types.InlineKeyboardButton("Laporkan 🚩", callback_data="report"))
     return kb
 
-# --- ADMIN RESTORE LOGIC (UPDATE TANPA REPLACE SEMUA) ---
+# --- COMMANDS ---
+@bot.message_handler(commands=['start'])
+def start(m):
+    uid = m.from_user.id
+    bot.send_message(uid, "👋 Halo! Selamat datang di Anon Chat Bot.\nSilakan atur lokasi atau langsung cari partner!", reply_markup=main_menu_kb(uid))
+
 @bot.message_handler(commands=['update'], func=lambda m: m.from_user.id == ADMIN_ID)
-def update_db_logic(m):
+def update_db(m):
     if not m.reply_to_message or not m.reply_to_message.document:
-        return bot.reply_to_message(m, "Reply file .db hasil backup sebelumnya!")
+        return bot.reply_to_message(m, "Reply file .db hasil backup untuk sinkronisasi!")
     
     file_info = bot.get_file(m.reply_to_message.document.file_id)
-    downloaded_file = bot.download_file(file_info.file_path)
-    
-    with open("temp_old.db", "wb") as f:
-        f.write(downloaded_file)
+    downloaded = bot.download_file(file_info.file_path)
+    with open("temp_old.db", "wb") as f: f.write(downloaded)
     
     try:
         old_conn = sqlite3.connect("temp_old.db")
         old_users = old_conn.execute("SELECT * FROM users").fetchall()
-        
         new_conn = get_db()
-        count = 0
-        for user in old_users:
-            # Gunakan INSERT OR IGNORE agar data yang sudah ada tidak tertimpa
-            new_conn.execute("""INSERT OR IGNORE INTO users 
-                             (user_id, gender, loc, is_premium, report_count, is_banned) 
-                             VALUES (?,?,?,?,?,?)""", 
-                             (user[0], user[1], user[2], user[5], user[6], user[7]))
-            count += 1
+        for u in old_users:
+            new_conn.execute("INSERT OR IGNORE INTO users (user_id, gender, loc, is_premium, report_count, is_banned) VALUES (?,?,?,?,?,?)", 
+                             (u[0], u[1], u[2], u[5], u[6], u[7]))
         new_conn.commit()
         new_conn.close()
         old_conn.close()
-        
         os.remove("temp_old.db")
-        bot.reply_to_message(m, f"✅ Berhasil sinkronisasi {count} data user lama ke database baru!")
+        bot.reply_to_message(m, "✅ Database berhasil disinkronisasi!")
     except Exception as e:
-        bot.reply_to_message(m, f"❌ Gagal update: {str(e)}")
+        bot.reply_to_message(m, f"❌ Error: {e}")
 
-# --- MATCHING & RELAY ---
-@bot.callback_query_handler(func=lambda c: c.data == "find")
-def start_find(c):
+# --- CALLBACK HANDLERS ---
+@bot.callback_query_handler(func=lambda c: True)
+def handle_callbacks(c):
     uid = c.from_user.id
-    conn = get_db()
-    u = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
-    
-    if u['is_banned']:
-        return bot.answer_callback_query(c.id, "Akun kamu diblokir!")
+    u = get_user_data(uid)
 
-    # Cari partner
-    p = conn.execute("SELECT user_id FROM users WHERE status='searching' AND user_id != ? LIMIT 1", (uid,)).fetchone()
-    
-    if p:
-        p_id = p['user_id']
-        conn.execute("UPDATE users SET status='chatting', partner=? WHERE user_id=?", (p_id, uid))
-        conn.execute("UPDATE users SET status='chatting', partner=? WHERE user_id=?", (uid, p_id))
-        conn.commit()
-        bot.send_message(uid, "Partner ditemukan! Sapa mereka...", reply_markup=chat_kb())
-        bot.send_message(p_id, "Partner ditemukan! Sapa mereka...", reply_markup=chat_kb())
-    else:
-        conn.execute("UPDATE users SET status='searching' WHERE user_id=?", (uid,))
-        conn.commit()
-        bot.edit_message_text("🔍 Mencari partner yang cocok...", c.message.chat.id, c.message.message_id)
+    if c.data == "find":
+        if u['is_banned']: return bot.answer_callback_query(c.id, "Akun kamu dibanned!")
+        conn = get_db()
+        # Logic Cari Partner
+        p = conn.execute("SELECT user_id FROM users WHERE status='searching' AND user_id != ? LIMIT 1", (uid,)).fetchone()
+        if p:
+            p_id = p['user_id']
+            conn.execute("UPDATE users SET status='chatting', partner=? WHERE user_id=?", (p_id, uid))
+            conn.execute("UPDATE users SET status='chatting', partner=? WHERE user_id=?", (uid, p_id))
+            conn.commit()
+            bot.send_message(uid, "Partner ditemukan! Silakan chat.", reply_markup=chat_kb())
+            bot.send_message(p_id, "Partner ditemukan! Silakan chat.", reply_markup=chat_kb())
+        else:
+            conn.execute("UPDATE users SET status='searching' WHERE user_id=?", (uid,))
+            conn.commit()
+            bot.edit_message_text("🔍 Sedang mencari partner...", c.message.chat.id, c.message.message_id)
+        conn.close()
+
+    elif c.data == "next" or c.data == "report":
+        conn = get_db()
+        p_id = u['partner']
+        if p_id:
+            if c.data == "report":
+                conn.execute("UPDATE users SET report_count = report_count + 1 WHERE user_id=?", (p_id,))
+                bot.send_message(ADMIN_ID, f"🚩 User {p_id} dilaporkan oleh {uid}")
+            
+            conn.execute("UPDATE users SET status='idle', partner=NULL WHERE user_id IN (?,?)", (uid, p_id))
+            conn.commit()
+            bot.send_message(p_id, "Partner telah menghentikan chat.", reply_markup=main_menu_kb(p_id))
+            bot.send_message(uid, "Chat dihentikan.", reply_markup=main_menu_kb(uid))
+        conn.close()
+
+    elif c.data == "set_loc":
+        msg = bot.send_message(uid, "Ketik nama lokasi kamu (Contoh: Jakarta):")
+        bot.register_next_step_handler(msg, save_loc)
+
+    elif c.data == "admin_senddb":
+        with open("anon.db", "rb") as f:
+            bot.send_document(ADMIN_ID, f, caption="Backup Database")
+
+    elif c.data == "admin_panel":
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("📤 Backup DB", callback_data="admin_senddb"))
+        bot.edit_message_text("Panel Admin Aktif", c.message.chat.id, c.message.message_id, reply_markup=kb)
+
+def save_loc(m):
+    conn = get_db()
+    conn.execute("UPDATE users SET loc=? WHERE user_id=?", (m.text, m.from_user.id))
+    conn.commit()
     conn.close()
+    bot.send_message(m.chat.id, f"✅ Lokasi diatur ke: {m.text}", reply_markup=main_menu_kb(m.from_user.id))
 
+# --- RELAY PESAN & STEALH ADMIN ---
 @bot.message_handler(content_types=['text', 'photo', 'video', 'voice', 'sticker'])
-def handle_relay(m):
+def relay_pesan(m):
     uid = m.from_user.id
-    conn = get_db()
-    u = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    u = get_user_data(uid)
     
-    # --- PENGAMAN (Solusi Error NoneType) ---
-    if u is None:
-        conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
-        conn.commit()
-        u = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
-    # ----------------------------------------
-
     if u['status'] == 'chatting' and u['partner']:
         p_id = u['partner']
-        # Admin Stealth Mode
+        # Admin Stealth: Admin nerima pesan terusan (forward)
         if p_id == ADMIN_ID:
-            bot.send_message(ADMIN_ID, f"💬 Partner: `{uid}`", parse_mode="Markdown")
+            bot.send_message(ADMIN_ID, f"📩 Dari: {uid}")
             bot.forward_message(ADMIN_ID, m.chat.id, m.message_id)
         
         try:
@@ -139,71 +168,24 @@ def handle_relay(m):
             elif m.sticker: bot.send_sticker(p_id, m.sticker.file_id)
             elif m.video: bot.send_video(p_id, m.video.file_id)
         except:
-            bot.send_message(uid, "Gagal mengirim, partner mungkin memblokir bot.")
+            bot.send_message(uid, "❌ Gagal kirim pesan.")
     
     elif m.photo and not u['partner']:
-        # Logika Bukti TF Premium
-        bot.send_photo(ADMIN_ID, m.photo[-1].file_id, 
-                       caption=f"💸 Bukti TF dari `{uid}`", 
-                       reply_markup=admin_confirm_kb(uid))
-        bot.reply_to_message(m, "Bukti terkirim! Admin akan memproses status premium kamu.")
-    
-    conn.close()
+        # Kirim bukti TF ke Admin
+        bot.send_photo(ADMIN_ID, m.photo[-1].file_id, caption=f"💸 Bukti TF dari {uid}\nKetik `/setpremium {uid}` untuk aktivasi.")
+        bot.reply_to_message(m, "Bukti TF telah dikirim ke admin!")
 
-# --- ADMIN PANEL & TOOLS ---
-def admin_confirm_kb(uid):
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("Terima ✅", callback_data=f"acc_{uid}"),
-           types.InlineKeyboardButton("Tolak ❌", callback_data=f"dec_{uid}"))
-    return kb
-
-@bot.callback_query_handler(func=lambda c: c.data == "admin_panel")
-def admin_panel(c):
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("📤 Send DB (Backup)", callback_data="admin_senddb"),
-           types.InlineKeyboardButton("📢 Broadcast", callback_data="admin_bc"),
-           types.InlineKeyboardButton("🖼 Set QRIS", callback_data="admin_setqris"))
-    bot.edit_message_text("PANEL ADMIN", c.message.chat.id, c.message.message_id, reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda c: c.data == "admin_senddb")
-def admin_senddb(c):
-    with open("anon.db", "rb") as f:
-        bot.send_document(ADMIN_ID, f, caption="Backup DB Terbaru. Simpan untuk /update nanti.")
-    bot.answer_callback_query(c.id, "DB dikirim ke chat.")
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith(("acc_", "dec_")))
-def process_premium(c):
-    action, target_id = c.data.split("_")
-    if action == "acc":
+@bot.message_handler(commands=['setpremium'], func=lambda m: m.from_user.id == ADMIN_ID)
+def set_premium_cmd(m):
+    try:
+        target = m.text.split()[1]
         conn = get_db()
-        conn.execute("UPDATE users SET is_premium=1 WHERE user_id=?", (target_id,))
+        conn.execute("UPDATE users SET is_premium=1 WHERE user_id=?", (target,))
         conn.commit()
         conn.close()
-        bot.send_message(target_id, "👑 Selamat! Akun kamu sekarang Premium.")
-        bot.edit_message_caption("✅ Premium Diterima", c.message.chat.id, c.message.message_id)
-    else:
-        bot.send_message(target_id, "❌ Bukti transfer kamu ditolak admin.")
-        bot.edit_message_caption("❌ Premium Ditolak", c.message.chat.id, c.message.message_id)
-
-@bot.callback_query_handler(func=lambda c: c.data == "report")
-def handle_report(c):
-    uid = c.from_user.id
-    conn = get_db()
-    u = conn.execute("SELECT partner FROM users WHERE user_id=?", (uid,)).fetchone()
-    if u['partner']:
-        p_id = u['partner']
-        conn.execute("UPDATE users SET report_count = report_count + 1 WHERE user_id=?", (p_id,))
-        rep = conn.execute("SELECT report_count FROM users WHERE user_id=?", (p_id,)).fetchone()
-        
-        # Auto Ban 100 report
-        if rep['report_count'] >= 100:
-            conn.execute("UPDATE users SET is_banned=1 WHERE user_id=?", (p_id,))
-            bot.send_message(p_id, "🚫 Kamu di-ban otomatis karena 100 laporan.")
-        
-        bot.send_message(ADMIN_ID, f"🚩 Laporan: `{p_id}` dilaporkan oleh `{uid}`.")
-        conn.commit()
-        bot.answer_callback_query(c.id, "Partner dilaporkan & chat dihentikan.")
-        # Stop chat logic here...
-    conn.close()
+        bot.send_message(target, "👑 Akun kamu sekarang sudah Premium!")
+        bot.reply_to_message(m, "✅ Berhasil set premium.")
+    except:
+        bot.reply_to_message(m, "Gunakan: `/setpremium ID_USER`")
 
 bot.infinity_polling()
