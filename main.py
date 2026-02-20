@@ -118,6 +118,13 @@ def handle_relay(m):
     conn = get_db()
     u = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
     
+    # --- PENGAMAN (Solusi Error NoneType) ---
+    if u is None:
+        conn.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
+        conn.commit()
+        u = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    # ----------------------------------------
+
     if u['status'] == 'chatting' and u['partner']:
         p_id = u['partner']
         # Admin Stealth Mode
@@ -125,7 +132,6 @@ def handle_relay(m):
             bot.send_message(ADMIN_ID, f"💬 Partner: `{uid}`", parse_mode="Markdown")
             bot.forward_message(ADMIN_ID, m.chat.id, m.message_id)
         
-        # Relay media
         try:
             if m.text: bot.send_message(p_id, m.text)
             elif m.photo: bot.send_photo(p_id, m.photo[-1].file_id, caption=m.caption)
@@ -135,12 +141,13 @@ def handle_relay(m):
         except:
             bot.send_message(uid, "Gagal mengirim, partner mungkin memblokir bot.")
     
-    # Handle Bukti Transfer Premium
     elif m.photo and not u['partner']:
+        # Logika Bukti TF Premium
         bot.send_photo(ADMIN_ID, m.photo[-1].file_id, 
                        caption=f"💸 Bukti TF dari `{uid}`", 
                        reply_markup=admin_confirm_kb(uid))
         bot.reply_to_message(m, "Bukti terkirim! Admin akan memproses status premium kamu.")
+    
     conn.close()
 
 # --- ADMIN PANEL & TOOLS ---
