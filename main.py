@@ -31,14 +31,25 @@ def init_db():
 
 init_db()
 
-# --- COMMAND LIST HELPER ---
+# --- COMMAND LIST HELPER (SCOPED) ---
 def set_bot_commands():
-    commands = [
-        types.BotCommand("start", "Mulai & Buka Menu Utama"),
-        types.BotCommand("admin", "Panel Kontrol (Khusus Admin)"),
-        types.BotCommand("stats", "Cek Statistik Bot")
-    ]
-    bot.set_my_commands(commands)
+    # 1. Command untuk User Biasa (Hanya muncul /start)
+    bot.set_my_commands(
+        [types.BotCommand("start", "Mulai & Buka Menu Utama")],
+        scope=types.BotCommandScopeDefault()
+    )
+    # 2. Command Khusus Admin (Hanya muncul di HP Admin)
+    try:
+        bot.set_my_commands(
+            [
+                types.BotCommand("start", "Mulai & Buka Menu Utama"),
+                types.BotCommand("admin", "Panel Kontrol (Khusus Admin)"),
+                types.BotCommand("update", "Sinkronisasi Database")
+            ],
+            scope=types.BotCommandScopeChat(ADMIN_ID)
+        )
+    except Exception:
+        pass # Abaikan jika admin belum pernah start bot sama sekali
 
 set_bot_commands()
 
@@ -93,7 +104,7 @@ def rating_kb(target_id):
     kb.add(types.InlineKeyboardButton("LAPORKAN (REPORT) 🚩", callback_data=f"rt_rep_{target_id}"))
     return kb
 
-# --- ADMIN PROCESS ---
+# --- ADMIN PROCESS COMMANDS ---
 @bot.message_handler(commands=['admin'])
 def admin_panel_cmd(m):
     if m.from_user.id != ADMIN_ID: return
@@ -202,17 +213,18 @@ def relay_system(m):
                 elif m.sticker: bot.send_sticker(p_id, m.sticker.file_id)
         except: bot.send_message(uid, "⚠️ Gagal kirim pesan.")
     
-    # 3. Bukti Transfer
+    # 3. Bukti Transfer (Masuk jika user upload foto dan lagi nggak chatting)
     elif m.photo and not u['partner']:
         bot.send_message(uid, "✅ Bukti SS diterima! Admin akan segera memproses.")
         kb = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("ACC PREMIUM ✅", callback_data=f"adm_setprem_{uid}"))
-        bot.send_photo(ADMIN_ID, m.photo[-1].file_id, caption=f"💸 Konfirmasi Premium: `{uid}`", reply_markup=kb)
+        bot.send_photo(ADMIN_ID, m.photo[-1].file_id, caption=f"💸 Konfirmasi Premium dari ID: `{uid}`", reply_markup=kb)
 
-# --- CALLBACKS (RATING, REPORT, ADMIN) ---
+# --- CALLBACKS (RATING, REPORT, ADMIN, SETTINGS) ---
 @bot.callback_query_handler(func=lambda c: True)
 def calls(c):
     uid = c.from_user.id
     
+    # --- SISTEM RATING & REPORT ---
     if c.data.startswith("rt_"):
         _, act, tid = c.data.split("_")
         conn = get_db()
@@ -221,30 +233,83 @@ def calls(c):
         elif act == "rep":
             target = get_user(tid)
             history = "\n".join(json.loads(target['chat_history']))
-            bot.send_message(ADMIN_ID, f"🚩 **REPORT MASUK**\nTarget: `{tid}`\nReporter: `{uid}`\n\n**Riwayat Chat Terakhir:**\n`{history}`", parse_mode="Markdown")
+            bot.send_message(ADMIN_ID, f"🚩 **REPORT MASUK**\nTarget ID: `{tid}`\nReporter: `{uid}`\n\n**Riwayat Chat Terakhir:**\n`{history}`", parse_mode="Markdown")
             bot.answer_callback_query(c.id, "Laporan terkirim ke Admin!")
         conn.commit()
         bot.edit_message_text("Terima kasih atas feedback-nya!", c.message.chat.id, c.message.message_id)
+        bot.send_message(uid, "Pilih menu untuk melanjutkan:", reply_markup=main_menu(uid))
 
-    elif c.data == "adm_qris":
+    # --- PENGATURAN USER (GENDER/LOKASI) ---
+    elif c.data == "set_loc":
+        msg = bot.send_message(uid, "Ketik nama kotamu (Contoh: Jakarta):")
+        bot.register_next_step_handler(msg, lambda m: (
+            get_db().execute("UPDATE users SET loc=? WHERE user_id=?", (m.text, uid)).connection.commit(),
+            bot.send_message(uid, "✅ Lokasi tersimpan!", reply_markup=main_menu(uid))
+        ))
+    
+    elif c.data == "set_gender":
+        kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        kb.add("Pria", "Wanita")
+        msg = bot.send_message(uid, "Pilih Gendermu:", reply_markup=kb)
+        bot.register_next_step_handler(msg, lambda m: (
+            get_db().execute("UPDATE users SET gender=? WHERE user_id=?", (m.text, uid)).connection.commit(),
+            bot.send_message(uid, "✅ Gender tersimpan!", reply_markup=types.ReplyKeyboardRemove()),
+            bot.send_message(uid, "Menu Utama:", reply_markup=main_menu(uid))
+        ))
+    
+    # --- FITUR PREMIUM ---
+    elif c.data == "reconnect":
+        u = get_user(uid)
+        if u['last_partner']:
+            bot.send_message(u['last_partner'], "🔄 Mantan partnermu kangen dan ingin chat lagi! Coba cari partner sekarang.")
+            bot.answer_callback_query(c.id, "Pesan reconnect terkirim ke mantan partnermu!")
+        else:
+            bot.answer_callback_query(c.id, "Belum ada mantan partner.", show_alert=True)
+
+    elif c.data == "buy_prem":
+        conf = get_db().execute("SELECT * FROM config WHERE id=1").fetchone()
+        if conf['qris_id']: bot.send_photo(c.message.chat.id, conf['qris_id'], caption=conf['prem_text'])
+        else: bot.send_message(c.message.chat.id, conf['prem_text'])
+
+    # --- ADMIN CALLBACKS FULL ---
+    elif c.data == "adm_qris" and uid == ADMIN_ID:
         bot.send_message(ADMIN_ID, "Kirim foto QRIS baru:")
         bot.register_next_step_handler(c.message, lambda m: (
             get_db().execute("UPDATE config SET qris_id=? WHERE id=1", (m.photo[-1].file_id,)).connection.commit(),
             bot.send_message(ADMIN_ID, "✅ QRIS Update!")
+        ) if m.photo else bot.send_message(ADMIN_ID, "Gagal. Harus berupa foto!"))
+
+    elif c.data == "adm_txt" and uid == ADMIN_ID:
+        bot.send_message(ADMIN_ID, "Ketik pesan/teks promosi premium baru:")
+        bot.register_next_step_handler(c.message, lambda m: (
+            get_db().execute("UPDATE config SET prem_text=? WHERE id=1", (m.text,)).connection.commit(),
+            bot.send_message(ADMIN_ID, "✅ Teks Premium Update!")
         ))
+
+    elif c.data == "adm_bc" and uid == ADMIN_ID:
+        bot.send_message(ADMIN_ID, "Kirim pesan broadcast untuk semua user:")
+        def send_bc(m):
+            conn = get_db()
+            users = conn.execute("SELECT user_id FROM users").fetchall()
+            sukses = 0
+            for u in users:
+                try:
+                    bot.send_message(u['user_id'], f"📢 **BROADCAST ADMIN**\n\n{m.text}", parse_mode="Markdown")
+                    sukses += 1
+                except: pass
+            bot.send_message(ADMIN_ID, f"✅ Broadcast selesai ke {sukses} user!")
+        bot.register_next_step_handler(c.message, send_bc)
+
+    elif c.data == "adm_db" and uid == ADMIN_ID:
+        with open("anon_ultimate.db", "rb") as f: bot.send_document(ADMIN_ID, f, caption="Backup Database")
 
     elif c.data.startswith("adm_setprem_"):
         target = c.data.split("_")[2]
         conn = get_db()
         conn.execute("UPDATE users SET is_premium=1 WHERE user_id=?", (target,))
         conn.commit()
-        bot.send_message(target, "👑 Selamat! Akun kamu sekarang PREMIUM.")
-        bot.answer_callback_query(c.id, "User Promoted!")
-
-    elif c.data == "buy_prem":
-        conf = get_db().execute("SELECT * FROM config WHERE id=1").fetchone()
-        if conf['qris_id']: bot.send_photo(c.message.chat.id, conf['qris_id'], caption=conf['prem_text'])
-        else: bot.send_message(c.message.chat.id, conf['prem_text'])
+        bot.send_message(target, "👑 Selamat! Akun kamu sekarang PREMIUM.\nSilakan gunakan menu /start untuk cek status baru.", parse_mode="Markdown")
+        bot.edit_message_caption("✅ USER TELAH JADI PREMIUM!", c.message.chat.id, c.message.message_id)
 
 @bot.message_handler(commands=['start'])
 def welcome(m):
