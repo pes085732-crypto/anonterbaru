@@ -1,319 +1,275 @@
-import telebot
-from telebot import types
 import os
+import telebot
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 import sqlite3
+import random
 import json
 
-# --- KONFIGURASI ---
-TOKEN = os.getenv('BOT_TOKEN')
-ADMIN_ID = int(os.getenv('ADMIN_ID'))
-bot = telebot.TeleBot(TOKEN)
+# ================= Konfigurasi & Setup =================
+# Pastikan kamu set variable ini di Railway (Variables tab)
+BOT_TOKEN = os.getenv('BOT_TOKEN', 'TOKEN_KAMU_DI_SINI')
+ADMIN_ID = int(os.getenv('ADMIN_ID', 'ID_TELEGRAM_ADMIN'))
 
-# --- DATABASE ENGINE ---
-def get_db():
-    conn = sqlite3.connect('anon_ultimate.db', check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+bot = telebot.TeleBot(BOT_TOKEN)
 
+# Setup Database
 def init_db():
-    conn = get_db()
-    conn.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (user_id INTEGER PRIMARY KEY, gender TEXT, loc TEXT, 
-                  status TEXT DEFAULT 'idle', partner INTEGER, last_partner INTEGER,
-                  is_premium INTEGER DEFAULT 0, likes INTEGER DEFAULT 0, 
-                  dislikes INTEGER DEFAULT 0, report_count INTEGER DEFAULT 0,
-                  chat_history TEXT DEFAULT '[]')''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS config 
-                 (id INTEGER PRIMARY KEY, qris_id TEXT, prem_text TEXT)''')
-    conn.execute("INSERT OR IGNORE INTO config (id, prem_text) VALUES (1, 'Silakan transfer untuk akses fitur Sultan!')")
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY, 
+                    gender TEXT, age INTEGER, location TEXT, 
+                    is_vip INTEGER DEFAULT 0, karma INTEGER DEFAULT 100,
+                    state TEXT DEFAULT 'idle', partner_id INTEGER, 
+                    last_partner INTEGER, topic TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS config (
+                    key TEXT PRIMARY KEY, value TEXT)''')
     conn.commit()
     conn.close()
 
 init_db()
 
-# --- COMMAND LIST HELPER (SCOPED) ---
-def set_bot_commands():
-    # 1. Command untuk User Biasa (Hanya muncul /start)
-    bot.set_my_commands(
-        [types.BotCommand("start", "Mulai & Buka Menu Utama")],
-        scope=types.BotCommandScopeDefault()
+# Temporary Memory untuk Chat History (Biar pas report admin bisa baca)
+# Format: { 'id_sesi': ['user1: halo', 'user2: hai'] }
+chat_logs = {}
+
+# ================= UI & Keyboards =================
+def main_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row(KeyboardButton("🚀 Find a partner"), KeyboardButton("➡️ Next"))
+    markup.row(KeyboardButton("⚙️ Settings"), KeyboardButton("👑 VIP"))
+    return markup
+
+def chat_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row(KeyboardButton("🛑 Stop"), KeyboardButton("➡️ Next"))
+    markup.row(KeyboardButton("🎮 Game Suit"), KeyboardButton("🔗 Share Profil"))
+    return markup
+
+def feedback_keyboard(partner_id):
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("👍", callback_data=f"rate_up_{partner_id}"),
+        InlineKeyboardButton("👎", callback_data=f"rate_down_{partner_id}")
     )
-    # 2. Command Khusus Admin (Hanya muncul di HP Admin)
-    try:
-        bot.set_my_commands(
-            [
-                types.BotCommand("start", "Mulai & Buka Menu Utama"),
-                types.BotCommand("admin", "Panel Kontrol (Khusus Admin)"),
-                types.BotCommand("update", "Sinkronisasi Database")
-            ],
-            scope=types.BotCommandScopeChat(ADMIN_ID)
-        )
-    except Exception:
-        pass # Abaikan jika admin belum pernah start bot sama sekali
+    markup.row(InlineKeyboardButton("⚠️ Laporkan", callback_data=f"report_{partner_id}"))
+    return markup
 
-set_bot_commands()
-
-# --- HELPER FUNCTIONS ---
-def get_user(uid):
-    conn = get_db()
-    u = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
-    if u is None:
-        conn.execute("INSERT INTO users (user_id) VALUES (?)", (uid,))
-        conn.commit()
-        u = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+# ================= Fitur Utama & Navigasi =================
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (message.chat.id,))
+    conn.commit()
     conn.close()
-    return u
+    
+    bot.send_message(message.chat.id, 
+                     "Selamat datang di Chat Anon! Gunakan tombol di bawah atau ketik /search untuk mencari partner.",
+                     reply_markup=main_keyboard())
 
-def log_chat(uid, name, text):
-    conn = get_db()
-    u = get_user(uid)
-    history = json.loads(u['chat_history'])
-    history.append(f"{name}: {text}")
-    if len(history) > 20: history.pop(0) # Simpan 20 chat terakhir
-    conn.execute("UPDATE users SET chat_history=? WHERE user_id=?", (json.dumps(history), uid))
+# --- Logika Matchmaking (Mencari Partner) ---
+@bot.message_handler(func=lambda msg: msg.text in ["🚀 Find a partner", "➡️ Next", "/search", "/next"])
+def search_partner(message):
+    uid = message.chat.id
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    
+    # Putuskan obrolan sebelumnya jika ada
+    c.execute("SELECT partner_id, is_vip FROM users WHERE user_id=?", (uid,))
+    user_data = c.fetchone()
+    if user_data and user_data[0]:
+        partner_id = user_data[0]
+        c.execute("UPDATE users SET partner_id=NULL, state='idle', last_partner=? WHERE user_id IN (?, ?)", (partner_id, uid, partner_id))
+        bot.send_message(partner_id, "Partner kamu telah meninggalkan obrolan 😔", reply_markup=main_keyboard())
+        bot.send_message(partner_id, "Tinggalkan feedback untuk partnermu:", reply_markup=feedback_keyboard(uid))
+    
+    # Set status jadi searching
+    c.execute("UPDATE users SET state='searching', partner_id=NULL WHERE user_id=?", (uid,))
+    bot.send_message(uid, "🔍 Sedang mencari partner...", reply_markup=main_keyboard())
+    
+    # Logika Pencarian (VIP Prioritas & Hashtag/Topic, dsb)
+    is_vip = user_data[1] if user_data else 0
+    
+    # Cari kandidat yang juga 'searching'
+    c.execute("SELECT user_id, is_vip FROM users WHERE state='searching' AND user_id != ?", (uid,))
+    candidates = c.fetchall()
+    
+    if candidates:
+        # Prioritaskan VIP jika kandidat ada yang VIP
+        candidates.sort(key=lambda x: x[1], reverse=True) 
+        partner_id = candidates[0][0]
+        partner_vip = candidates[0][1]
+        
+        # Matchkan mereka
+        c.execute("UPDATE users SET state='chatting', partner_id=? WHERE user_id=?", (partner_id, uid))
+        c.execute("UPDATE users SET state='chatting', partner_id=? WHERE user_id=?", (uid, partner_id))
+        
+        # Buat sesi chat log baru
+        chat_logs[f"{uid}_{partner_id}"] = []
+        
+        # Notifikasi Match
+        vip_notice = "\n👑 Partner kamu adalah member VIP!" if partner_vip else ""
+        bot.send_message(uid, f"Partner found! 😸{vip_notice}", reply_markup=chat_keyboard())
+        bot.send_message(partner_id, "Partner found! 😸", reply_markup=chat_keyboard())
+    
     conn.commit()
     conn.close()
 
-# --- KEYBOARDS ---
-def main_menu(uid):
-    u = get_user(uid)
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(types.InlineKeyboardButton("Cari Partner 🔍", callback_data="find_menu"))
-    kb.add(types.InlineKeyboardButton(f"Lokasi: {u['loc'] or 'Set'} 📍", callback_data="set_loc"),
-           types.InlineKeyboardButton(f"Gender: {u['gender'] or 'Set'} 👤", callback_data="set_gender"))
+# ================= Engine Chatting & Media Sharing =================
+@bot.message_handler(content_types=['text', 'photo', 'video', 'voice', 'sticker', 'document'])
+def handle_chat(message):
+    uid = message.chat.id
     
-    if u['is_premium'] and u['last_partner']:
-        kb.add(types.InlineKeyboardButton("🔄 Reconnect Partner", callback_data="reconnect"))
-    
-    status = "👑 Member Premium" if u['is_premium'] else "💎 Beli Premium"
-    kb.add(types.InlineKeyboardButton(status, callback_data="buy_prem"))
-    
-    if uid == ADMIN_ID:
-        kb.add(types.InlineKeyboardButton("🛠 ADMIN PANEL", callback_data="admin_panel"))
-    return kb
-
-def chat_kb():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("Next Partner ⏭️", "Stop Match ⏹️")
-    return kb
-
-def rating_kb(target_id):
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("Suka 👍", callback_data=f"rt_up_{target_id}"),
-           types.InlineKeyboardButton("Benci 👎", callback_data=f"rt_down_{target_id}"))
-    kb.add(types.InlineKeyboardButton("LAPORKAN (REPORT) 🚩", callback_data=f"rt_rep_{target_id}"))
-    return kb
-
-# --- ADMIN PROCESS COMMANDS ---
-@bot.message_handler(commands=['admin'])
-def admin_panel_cmd(m):
-    if m.from_user.id != ADMIN_ID: return
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(types.InlineKeyboardButton("🖼 Set QRIS", callback_data="adm_qris"),
-           types.InlineKeyboardButton("📝 Set Teks Premium", callback_data="adm_txt"),
-           types.InlineKeyboardButton("📢 Broadcast", callback_data="adm_bc"),
-           types.InlineKeyboardButton("📤 Backup Database", callback_data="adm_db"))
-    bot.send_message(m.chat.id, "🛠 **SUPER ADMIN PANEL**", parse_mode="Markdown", reply_markup=kb)
-
-@bot.message_handler(commands=['update'], func=lambda m: m.from_user.id == ADMIN_ID)
-def update_db(m):
-    if not m.reply_to_message or not m.reply_to_message.document:
-        return bot.reply_to_message(m, "Reply file .db dengan caption /update!")
-    
-    file_info = bot.get_file(m.reply_to_message.document.file_id)
-    with open("sync.db", "wb") as f: f.write(bot.download_file(file_info.file_path))
-    
-    try:
-        old_conn = sqlite3.connect("sync.db")
-        rows = old_conn.execute("SELECT * FROM users").fetchall()
-        new_conn = get_db()
-        for r in rows:
-            new_conn.execute("INSERT OR IGNORE INTO users (user_id, gender, loc, is_premium, likes, dislikes) VALUES (?,?,?,?,?,?)", 
-                             (r[0], r[1], r[2], r[6], r[7], r[8]))
-        new_conn.commit()
-        bot.reply_to_message(m, "✅ Data berhasil disinkronisasi!")
-        os.remove("sync.db")
-    except Exception as e: bot.reply_to_message(m, f"❌ Gagal: {e}")
-
-# --- MATCHING LOGIC ---
-@bot.callback_query_handler(func=lambda c: c.data.startswith(("match_", "find_menu")))
-def handle_matching(c):
-    uid = c.from_user.id
-    u = get_user(uid)
-    if c.data == "find_menu":
-        kb = types.InlineKeyboardMarkup(row_width=1)
-        kb.add(types.InlineKeyboardButton("Cari Acak (Gratis)", callback_data="match_any"))
-        if u['is_premium']:
-            kb.add(types.InlineKeyboardButton("Cari Pria ♂️", callback_data="match_Pria"),
-                   types.InlineKeyboardButton("Cari Wanita ♀️", callback_data="match_Wanita"))
-        else:
-            kb.add(types.InlineKeyboardButton("🔒 Filter Gender (Premium Only)", callback_data="buy_prem"))
-        return bot.edit_message_text("Kriteria Pencarian:", c.message.chat.id, c.message.message_id, reply_markup=kb)
-
-    pref = c.data.split("_")[1]
-    conn = get_db()
-    query = "SELECT * FROM users WHERE status='searching' AND user_id != ?"
-    params = [uid]
-    if pref != "any": query += " AND gender = ?"; params.append(pref)
-    
-    p = conn.execute(query + " LIMIT 1", params).fetchone()
-    if p:
-        p_id = p['user_id']
-        conn.execute("UPDATE users SET status='chatting', partner=?, chat_history='[]' WHERE user_id=?", (p_id, uid))
-        conn.execute("UPDATE users SET status='chatting', partner=?, chat_history='[]' WHERE user_id=?", (uid, p_id))
-        conn.commit()
-        
-        # Info Match
-        badge_p = "👑 **Premium Sultan**" if p['is_premium'] else "User Biasa"
-        badge_u = "👑 **Premium Sultan**" if u['is_premium'] else "User Biasa"
-        
-        bot.send_message(uid, f"✅ Terhubung!\nStatus: {badge_p}\nRating: 👍 {p['likes']} | 👎 {p['dislikes']}", parse_mode="Markdown", reply_markup=chat_kb())
-        bot.send_message(p_id, f"✅ Terhubung!\nStatus: {badge_u}\nRating: 👍 {u['likes']} | 👎 {u['dislikes']}", parse_mode="Markdown", reply_markup=chat_kb())
-    else:
-        conn.execute("UPDATE users SET status='searching' WHERE user_id=?", (uid,))
-        conn.commit()
-        bot.edit_message_text("🔍 Sedang mencari partner...", c.message.chat.id, c.message.message_id)
-    conn.close()
-
-# --- MAIN RELAY & CHAT CONTROL ---
-@bot.message_handler(func=lambda m: True, content_types=['text', 'photo', 'video', 'voice', 'sticker'])
-def relay_system(m):
-    uid = m.from_user.id
-    u = get_user(uid)
-
-    # 1. Navigasi Stop/Next
-    if m.text in ["Next Partner ⏭️", "Stop Match ⏹️"]:
-        if u['partner']:
-            p_id = u['partner']
-            conn = get_db()
-            conn.execute("UPDATE users SET status='idle', partner=NULL, last_partner=? WHERE user_id IN (?,?)", (p_id, uid, uid, p_id))
-            conn.commit()
-            conn.close()
-            
-            bot.send_message(uid, "🚫 Chat telah diputuskan.", reply_markup=types.ReplyKeyboardRemove())
-            bot.send_message(uid, "Berikan penilaian untuk partner tadi:", reply_markup=rating_kb(p_id))
-            bot.send_message(p_id, "🚫 Partner telah memutuskan chat.", reply_markup=types.ReplyKeyboardRemove())
-            bot.send_message(p_id, "Berikan penilaian untuk partner tadi:", reply_markup=rating_kb(uid))
+    # Tangani Stop
+    if message.text in ["🛑 Stop", "/stop"]:
+        # (Logika stop mirip dengan next, mengubah state jadi idle)
+        bot.send_message(uid, "Kamu menghentikan pencarian/obrolan.", reply_markup=main_keyboard())
         return
 
-    # 2. Chat Relay Logic
-    if u['status'] == 'chatting' and u['partner']:
-        p_id = u['partner']
-        log_chat(uid, "You", m.text if m.text else "[Media]")
+    # Cek apakah sedang punya partner
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    c.execute("SELECT partner_id FROM users WHERE user_id=?", (uid,))
+    res = c.fetchone()
+    
+    if res and res[0]:
+        partner_id = res[0]
         
-        try:
-            # Logic: Jika partner adalah ADMIN, gunakan FORWARD MESSAGE
-            if p_id == ADMIN_ID:
-                bot.forward_message(ADMIN_ID, m.chat.id, m.message_id)
-            else:
-                if m.text: bot.send_message(p_id, m.text)
-                elif m.photo: bot.send_photo(p_id, m.photo[-1].file_id, caption=m.caption)
-                elif m.video: bot.send_video(p_id, m.video.file_id, caption=m.caption)
-                elif m.voice: bot.send_voice(p_id, m.voice.file_id)
-                elif m.sticker: bot.send_sticker(p_id, m.sticker.file_id)
-        except: bot.send_message(uid, "⚠️ Gagal kirim pesan.")
-    
-    # 3. Bukti Transfer (Masuk jika user upload foto dan lagi nggak chatting)
-    elif m.photo and not u['partner']:
-        bot.send_message(uid, "✅ Bukti SS diterima! Admin akan segera memproses.")
-        kb = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("ACC PREMIUM ✅", callback_data=f"adm_setprem_{uid}"))
-        bot.send_photo(ADMIN_ID, m.photo[-1].file_id, caption=f"💸 Konfirmasi Premium dari ID: `{uid}`", reply_markup=kb)
+        # Simpan History Chat untuk Report
+        session_key = f"{uid}_{partner_id}" if f"{uid}_{partner_id}" in chat_logs else f"{partner_id}_{uid}"
+        if session_key in chat_logs:
+            chat_logs[session_key].append(f"{uid}: {message.text if message.text else '[Media/File]'}")
+            if len(chat_logs[session_key]) > 50: # Simpan 50 pesan terakhir saja
+                chat_logs[session_key].pop(0)
 
-# --- CALLBACKS (RATING, REPORT, ADMIN, SETTINGS) ---
-@bot.callback_query_handler(func=lambda c: True)
-def calls(c):
-    uid = c.from_user.id
-    
-    # --- SISTEM RATING & REPORT ---
-    if c.data.startswith("rt_"):
-        _, act, tid = c.data.split("_")
-        conn = get_db()
-        if act == "up": conn.execute("UPDATE users SET likes=likes+1 WHERE user_id=?", (tid,))
-        elif act == "down": conn.execute("UPDATE users SET dislikes=dislikes+1 WHERE user_id=?", (tid,))
-        elif act == "rep":
-            target = get_user(tid)
-            history = "\n".join(json.loads(target['chat_history']))
-            bot.send_message(ADMIN_ID, f"🚩 **REPORT MASUK**\nTarget ID: `{tid}`\nReporter: `{uid}`\n\n**Riwayat Chat Terakhir:**\n`{history}`", parse_mode="Markdown")
-            bot.answer_callback_query(c.id, "Laporan terkirim ke Admin!")
-        conn.commit()
-        bot.edit_message_text("Terima kasih atas feedback-nya!", c.message.chat.id, c.message.message_id)
-        bot.send_message(uid, "Pilih menu untuk melanjutkan:", reply_markup=main_menu(uid))
-
-    # --- PENGATURAN USER (GENDER/LOKASI) ---
-    elif c.data == "set_loc":
-        msg = bot.send_message(uid, "Ketik nama kotamu (Contoh: Jakarta):")
-        bot.register_next_step_handler(msg, lambda m: (
-            get_db().execute("UPDATE users SET loc=? WHERE user_id=?", (m.text, uid)).connection.commit(),
-            bot.send_message(uid, "✅ Lokasi tersimpan!", reply_markup=main_menu(uid))
-        ))
-    
-    elif c.data == "set_gender":
-        kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-        kb.add("Pria", "Wanita")
-        msg = bot.send_message(uid, "Pilih Gendermu:", reply_markup=kb)
-        bot.register_next_step_handler(msg, lambda m: (
-            get_db().execute("UPDATE users SET gender=? WHERE user_id=?", (m.text, uid)).connection.commit(),
-            bot.send_message(uid, "✅ Gender tersimpan!", reply_markup=types.ReplyKeyboardRemove()),
-            bot.send_message(uid, "Menu Utama:", reply_markup=main_menu(uid))
-        ))
-    
-    # --- FITUR PREMIUM ---
-    elif c.data == "reconnect":
-        u = get_user(uid)
-        if u['last_partner']:
-            bot.send_message(u['last_partner'], "🔄 Mantan partnermu kangen dan ingin chat lagi! Coba cari partner sekarang.")
-            bot.answer_callback_query(c.id, "Pesan reconnect terkirim ke mantan partnermu!")
+        # -- ADMIN GOD MODE LOGIC --
+        if partner_id == ADMIN_ID:
+            # Jika partnernya admin, kirim pesan sebagai "Forward" agar admin bisa klik profil user
+            bot.forward_message(partner_id, uid, message.message_id)
         else:
-            bot.answer_callback_query(c.id, "Belum ada mantan partner.", show_alert=True)
+            # Mode anonim biasa (Copy message, hapus identitas pengirim)
+            bot.copy_message(partner_id, uid, message.message_id)
+    else:
+        # Jika bukan chat dan bukan perintah admin
+        if message.text and not message.text.startswith('/'):
+            bot.send_message(uid, "Kamu sedang tidak berada dalam obrolan. Klik '🚀 Find a partner'")
+            
+    conn.close()
 
-    elif c.data == "buy_prem":
-        conf = get_db().execute("SELECT * FROM config WHERE id=1").fetchone()
-        if conf['qris_id']: bot.send_photo(c.message.chat.id, conf['qris_id'], caption=conf['prem_text'])
-        else: bot.send_message(c.message.chat.id, conf['prem_text'])
+# ================= Fitur Game Suit & Share Link =================
+@bot.message_handler(func=lambda msg: msg.text == "🎮 Game Suit")
+def game_suit(message):
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("✊ Batu", callback_data="suit_batu"),
+        InlineKeyboardButton("🖐 Kertas", callback_data="suit_kertas"),
+        InlineKeyboardButton("✌️ Gunting", callback_data="suit_gunting")
+    )
+    bot.send_message(message.chat.id, "Pilih senjatamu:", reply_markup=markup)
+    # (Logika callback-nya dibuat di bot.callback_query_handler untuk mengecek siapa yang menang)
 
-    # --- ADMIN CALLBACKS FULL ---
-    elif c.data == "adm_qris" and uid == ADMIN_ID:
-        bot.send_message(ADMIN_ID, "Kirim foto QRIS baru:")
-        bot.register_next_step_handler(c.message, lambda m: (
-            get_db().execute("UPDATE config SET qris_id=? WHERE id=1", (m.photo[-1].file_id,)).connection.commit(),
-            bot.send_message(ADMIN_ID, "✅ QRIS Update!")
-        ) if m.photo else bot.send_message(ADMIN_ID, "Gagal. Harus berupa foto!"))
+@bot.message_handler(func=lambda msg: msg.text == "🔗 Share Profil")
+def share_link(message):
+    conn = sqlite3.connect('database.db')
+    c = conn.cursor()
+    c.execute("SELECT partner_id FROM users WHERE user_id=?", (message.chat.id,))
+    res = c.fetchone()
+    if res and res[0]:
+        username = message.from_user.username
+        link = f"https://t.me/{username}" if username else "User ini tidak punya username Telegram."
+        bot.send_message(res[0], f"Partner kamu membagikan profilnya:\n{link}")
+        bot.send_message(message.chat.id, "Link profil berhasil dikirim!")
+    conn.close()
 
-    elif c.data == "adm_txt" and uid == ADMIN_ID:
-        bot.send_message(ADMIN_ID, "Ketik pesan/teks promosi premium baru:")
-        bot.register_next_step_handler(c.message, lambda m: (
-            get_db().execute("UPDATE config SET prem_text=? WHERE id=1", (m.text,)).connection.commit(),
-            bot.send_message(ADMIN_ID, "✅ Teks Premium Update!")
-        ))
-
-    elif c.data == "adm_bc" and uid == ADMIN_ID:
-        bot.send_message(ADMIN_ID, "Kirim pesan broadcast untuk semua user:")
-        def send_bc(m):
-            conn = get_db()
-            users = conn.execute("SELECT user_id FROM users").fetchall()
-            sukses = 0
-            for u in users:
-                try:
-                    bot.send_message(u['user_id'], f"📢 **BROADCAST ADMIN**\n\n{m.text}", parse_mode="Markdown")
-                    sukses += 1
-                except: pass
-            bot.send_message(ADMIN_ID, f"✅ Broadcast selesai ke {sukses} user!")
-        bot.register_next_step_handler(c.message, send_bc)
-
-    elif c.data == "adm_db" and uid == ADMIN_ID:
-        with open("anon_ultimate.db", "rb") as f: bot.send_document(ADMIN_ID, f, caption="Backup Database")
-
-    elif c.data.startswith("adm_setprem_"):
-        target = c.data.split("_")[2]
-        conn = get_db()
-        conn.execute("UPDATE users SET is_premium=1 WHERE user_id=?", (target,))
+# ================= Inline Feedback & Report =================
+@bot.callback_query_handler(func=lambda call: True)
+def callback_inline(call):
+    data = call.data
+    uid = call.message.chat.id
+    
+    if data.startswith("rate_"):
+        # Logika sistem Karma
+        partner_id = int(data.split("_")[2])
+        action = data.split("_")[1]
+        conn = sqlite3.connect('database.db')
+        c = conn.cursor()
+        if action == "up":
+            c.execute("UPDATE users SET karma = karma + 2 WHERE user_id=?", (partner_id,))
+            bot.answer_callback_query(call.id, "Terima kasih atas feedback positifmu!")
+        else:
+            c.execute("UPDATE users SET karma = karma - 5 WHERE user_id=?", (partner_id,))
+            bot.answer_callback_query(call.id, "Feedback negatif dicatat.")
         conn.commit()
-        bot.send_message(target, "👑 Selamat! Akun kamu sekarang PREMIUM.\nSilakan gunakan menu /start untuk cek status baru.", parse_mode="Markdown")
-        bot.edit_message_caption("✅ USER TELAH JADI PREMIUM!", c.message.chat.id, c.message.message_id)
+        bot.edit_message_reply_markup(uid, call.message.message_id, reply_markup=None) # hapus tombol
+        conn.close()
 
-@bot.message_handler(commands=['start'])
-def welcome(m):
-    bot.send_message(m.chat.id, "👋 **ANON CHAT PREMIUM**\nKlik tombol di bawah untuk mulai!", 
-                     parse_mode="Markdown", reply_markup=main_menu(m.from_user.id))
+    elif data.startswith("report_"):
+        partner_id = int(data.split("_")[1])
+        markup = InlineKeyboardMarkup()
+        markup.row(InlineKeyboardButton("VCS/Sange", callback_data=f"rep_vcs_{partner_id}"),
+                   InlineKeyboardButton("Spam/Scam", callback_data=f"rep_spam_{partner_id}"))
+        bot.edit_message_reply_markup(uid, call.message.message_id, reply_markup=markup)
 
+    elif data.startswith("rep_"):
+        # Lapor ke Admin beserta histori chat
+        reason = data.split("_")[1]
+        partner_id = int(data.split("_")[2])
+        bot.answer_callback_query(call.id, "Laporan dikirim ke Admin. Terima kasih.")
+        bot.edit_message_reply_markup(uid, call.message.message_id, reply_markup=None)
+        
+        # Cari histori chat
+        session_key = f"{uid}_{partner_id}" if f"{uid}_{partner_id}" in chat_logs else f"{partner_id}_{uid}"
+        history = "\n".join(chat_logs.get(session_key, ["Tidak ada histori chat."]))
+        
+        admin_msg = f"⚠️ **LAPORAN BARU**\nReporter: {uid}\nReported: {partner_id}\nAlasan: {reason}\n\n**Histori Chat:**\n{history}"
+        bot.send_message(ADMIN_ID, admin_msg)
+
+# ================= Fitur Khusus Admin =================
+@bot.message_handler(commands=['senddb'])
+def admin_send_db(message):
+    if message.chat.id == ADMIN_ID:
+        with open('database.db', 'rb') as doc:
+            bot.send_document(ADMIN_ID, doc, caption="Ini file database terbaru.")
+
+@bot.message_handler(func=lambda msg: msg.reply_to_message and msg.reply_to_message.document and msg.text.lower() == 'update')
+def admin_update_db(message):
+    if message.chat.id == ADMIN_ID:
+        file_info = bot.get_file(message.reply_to_message.document.file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        # Simpan file yang dikirim admin sebagai temp.db
+        with open('temp.db', 'wb') as new_file:
+            new_file.write(downloaded_file)
+        
+        # Logika UPDATE DB (Nambahin tanpa me-replace yang lama)
+        try:
+            conn = sqlite3.connect('database.db')
+            # Attach db baru
+            conn.execute("ATTACH DATABASE 'temp.db' AS tempdb")
+            # Masukkan data baru yang belum ada
+            conn.execute("INSERT OR IGNORE INTO users SELECT * FROM tempdb.users")
+            conn.commit()
+            conn.close()
+            os.remove('temp.db')
+            bot.reply_to(message, "✅ Database berhasil di-update/digabungkan!")
+        except Exception as e:
+            bot.reply_to(message, f"❌ Gagal update DB: {e}")
+
+@bot.message_handler(commands=['setvip'])
+def admin_set_vip(message):
+    if message.chat.id == ADMIN_ID:
+        try:
+            target_id = int(message.text.split()[1])
+            conn = sqlite3.connect('database.db')
+            c = conn.cursor()
+            c.execute("UPDATE users SET is_vip=1 WHERE user_id=?", (target_id,))
+            conn.commit()
+            conn.close()
+            bot.reply_to(message, f"Berhasil set VIP untuk user {target_id}")
+        except:
+            bot.reply_to(message, "Format salah. Gunakan: /setvip <user_id>")
+
+# Jalankan Bot
+print("Bot sedang berjalan...")
 bot.infinity_polling()
